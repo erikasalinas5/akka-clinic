@@ -9,21 +9,27 @@ import com.clinic.domain.Appointment;
 import com.clinic.domain.AppointmentEvents;
 
 import java.util.List;
+import java.util.Optional;
+import java.util.OptionalInt;
 
 @Component(id = "appointments-by-patient")
 public class AppointmentsByPatientView extends View {
     public record AppointmentRow(String id, String patientId, String doctorId, String issue, String date, String time,
-                                 Appointment.Status status) {
+                                 Optional<String> priority, Appointment.Status status) {
         public AppointmentRow withStatus(Appointment.Status status) {
-            return new AppointmentRow(id, patientId, doctorId, issue, date, time, status);
+            return new AppointmentRow(id, patientId, doctorId, issue, date, time, priority, status);
         }
 
         public AppointmentRow withDate(String date, String time) {
-            return new AppointmentRow(id, patientId, doctorId, issue, date, time, status);
+            return new AppointmentRow(id, patientId, doctorId, issue, date, time, priority,status);
         }
 
         public AppointmentRow withDoctorId(String doctorId) {
-            return new AppointmentRow(id, patientId, doctorId, issue, date, time, status);
+            return new AppointmentRow(id, patientId, doctorId, issue, date, time, priority, status);
+        }
+
+        public AppointmentRow withPriority(String priority) {
+            return new AppointmentRow(id, patientId, doctorId, issue, date, time, Optional.of(priority),status);
         }
     }
 
@@ -32,12 +38,15 @@ public class AppointmentsByPatientView extends View {
         public Effect<AppointmentRow> onEvent(AppointmentEvents event) {
             return switch (event) {
                 case AppointmentEvents.AppointmentCreated e -> {
-                    var row = new AppointmentRow(e.id(),e.patientId(), e.doctorId(), e.issue(), e.dateTime().toLocalDate().toString(), e.dateTime().toLocalTime().toString(), Appointment.Status.PENDING);
+                    var row = new AppointmentRow(e.id(),e.patientId(), e.doctorId(), e.issue(), e.dateTime().toLocalDate().toString(), e.dateTime().toLocalTime().toString(), Optional.empty(), Appointment.Status.PENDING);
                     yield effects().updateRow(row);
                 }
                 case AppointmentEvents.AddedDoctorNotes e -> effects().ignore();
                 case AppointmentEvents.AddedPrescription e -> effects().ignore();
-                case AppointmentEvents.AddedPriority e -> effects().ignore();
+                case AppointmentEvents.AddedPriority e -> {
+                    var newRow = rowState().withPriority(e.priority());
+                    yield effects().updateRow(newRow);
+                }
                 case AppointmentEvents.Scheduled e -> {
                     var newRow = rowState().withStatus(Appointment.Status.SCHEDULED);
                     yield effects().updateRow(newRow);

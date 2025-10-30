@@ -5,14 +5,18 @@ import akka.javasdk.annotations.Component;
 import akka.javasdk.client.ComponentClient;
 import akka.javasdk.impl.WorkflowExceptions;
 import akka.javasdk.workflow.Workflow;
-import com.clinic.domain.CancelAppointmentState;
+import com.clinic.application.ai.PriorityAgent;
 import com.clinic.domain.CancelScheduleState;
 import com.clinic.domain.Schedule;
 
-import java.time.LocalDate;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Component(id = "cancel-schedule")
 public class CancelScheduleWorkflow extends Workflow<CancelScheduleState> {
@@ -57,57 +61,113 @@ public class CancelScheduleWorkflow extends Workflow<CancelScheduleState> {
                     .invoke();
             return stepEffects()
                     .updateState(currentState().withStatus(CancelScheduleState.Status.scheduleBlocked))
-                    .thenTransitionTo(CancelScheduleWorkflow::rescheduleAppointments);
+                    .thenTransitionTo(CancelScheduleWorkflow::addPriorityAppointments);
         } catch (IllegalArgumentException e) {
             return stepEffects().thenEnd();
         }
 
     }
 
-    public StepEffect rescheduleAppointments() {
+    public StepEffect addPriorityAppointments(){
+        System.out.println("## List appointments");
+        try {
+            AppointmentsByPatientView.AppointmentRows appointmentsDay = componentClient
+                    .forView()
+                    .method(AppointmentsByPatientView::findByDoctorAndDate)
+                    .invoke(new AppointmentsByPatientView.FindApptDoctorDate(currentState().doctorId(), currentState().dateTime().toLocalDate().toString()));
+            if (!appointmentsDay.appointments().isEmpty()) {
+                var futures = appointmentsDay.appointments().stream()
+                        .map(appointment ->
+                                componentClient.forAgent()
+                                        .inSession(appointment.id())
+                                        .method(PriorityAgent::urgency)
+                                        .invokeAsync(appointment.issue())
+                                        .thenCompose(priority ->
+                                                componentClient.forEventSourcedEntity(appointment.id())
+                                                        .method(AppointmentEntity::addPriority)
+                                                        .invokeAsync(priority)
+                                        )
+                        )
+                        .toList();
+                CompletableFuture<Void> all = CompletableFuture.allOf(
+                        futures.toArray(new CompletableFuture[0])
+                );
+                all.join();
+                System.out.println(all);
+
+                return stepEffects()
+                        .thenTransitionTo(CancelScheduleWorkflow::orderAppointments);
+            }
+            return stepEffects()
+                    .thenTransitionTo(CancelScheduleWorkflow::cancelScheduleStatus);
+        }
+        catch (IllegalArgumentException e) {
+            return stepEffects()
+                    .thenTransitionTo(CancelScheduleWorkflow::cancelScheduleStatus);
+        }
+    }
+
+    private int getPriorityOrder(String priority) {
+        return switch (priority.toLowerCase()) {
+            case "high" -> 1;
+            case "medium" -> 2;
+            case "low" -> 3;
+            default -> 99; // Default or unassigned priority goes last
+        };
+    }
+    private static String safeLower(Optional<String> s) { return s == null ? "" : s.toString().toLowerCase(); }
+
+
+    public StepEffect orderAppointments() {
         System.out.println("## Reschedule Appointments");
-        /*This function should call another workflow that
-        1. Order the list of timeslots by priority using an AI AGENT
-        2. Check availability in following days
-        3. One by one execute reschedulling appointment which command receive appointmentId, newDateTime, doctorId
-        and assign the closer timeslot
-        * we already have the function to change status of schedule from blocked to cancelled*/
-        var scheduleId = new Schedule.ScheduleId(
-                currentState().doctorId(),
-                currentState().dateTime().toLocalDate()
-        );
-        Optional<Schedule> schedule = componentClient
-                .forKeyValueEntity(scheduleId.toString())
-                .method(ScheduleEntity::getSchedule)
-                .invoke();
-        if (schedule.isEmpty()) {
+        AppointmentsByPatientView.AppointmentRows appointmentsDay = componentClient
+                .forView()
+                .method(AppointmentsByPatientView::findByDoctorAndDate)
+                .invoke(new AppointmentsByPatientView.FindApptDoctorDate(currentState().doctorId(), currentState().dateTime().toLocalDate().toString()));
+
+        if (appointmentsDay == null || appointmentsDay.appointments().isEmpty()) {
+            System.out.println("No appointments to order.");
             return stepEffects()
                     .updateState(currentState().withStatus(CancelScheduleState.Status.Failed))
                     .thenEnd();
-
         }
-        try{
-            var scheduleSlot = schedule.get().timeSlots().getFirst();
-            LocalDate date = currentState().dateTime().toLocalDate();
-            LocalTime startTime = scheduleSlot.startTime();
+        List<AppointmentsByPatientView.AppointmentRow> appointments =
+                new java.util.ArrayList<>(appointmentsDay.appointments());
+        appointments.sort(
+                Comparator
+                        .comparing((AppointmentsByPatientView.AppointmentRow a) ->
+                                getPriorityOrder(safeLower(a.priority())))
+                        .thenComparing(AppointmentsByPatientView.AppointmentRow::time)
+        );
 
-            LocalDateTime combined = date.atTime(startTime);
-            componentClient
-                    .forWorkflow(scheduleSlot.appointmentId())
-                    .method(CancelAppointmentWorkflow::cancel)
-                    .invoke(
-                            new CancelAppointmentWorkflow
-                                    .CancelAppointmentCommand(
-                                    scheduleSlot.appointmentId(),
-                                    combined,
-                                    currentState().doctorId()));
+
+        try {
+            // Build a sequential async chain: each step starts after the previous completes
+            CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+            AtomicInteger seq = new AtomicInteger(1);
+
+            for (var appt : appointments) {
+                int order = seq.getAndIncrement();
+
+                    componentClient
+                            .forWorkflow(appt.id())  // <- target workflow per appointment
+                            .method(CancelAppointmentWorkflow::cancel) // your method
+                            .invokeAsync(new CancelAppointmentWorkflow.CancelAppointmentCommand(
+                                    appt.id(),
+                                    LocalDateTime.of(currentState().dateTime().toLocalDate(), LocalTime.parse(appt.time())),
+                                    appt.doctorId()
+                ));
+            }
+
+            // wait for the whole chain (you can add a timeout)
+            chain.orTimeout(60, java.util.concurrent.TimeUnit.SECONDS).join();
+
             return stepEffects()
                     .updateState(currentState().withStatus(CancelScheduleState.Status.scheduleCancelled))
                     .thenTransitionTo(CancelScheduleWorkflow::cancelScheduleStatus);
         } catch (WorkflowExceptions.WorkflowException e) {
             return stepEffects().thenEnd();
         }
-
 
     }
     public StepEffect cancelScheduleStatus() {
@@ -128,5 +188,14 @@ public class CancelScheduleWorkflow extends Workflow<CancelScheduleState> {
             return stepEffects()
                     .updateState(currentState().withStatus(CancelScheduleState.Status.Failed)).thenEnd();
         }
+    }
+
+    @Override
+    public WorkflowSettings settings() {
+        return WorkflowSettingsBuilder
+                .newBuilder()
+                .stepTimeout(CancelScheduleWorkflow::addPriorityAppointments, Duration.ofSeconds(40))
+                .defaultStepRecovery(RecoverStrategy.maxRetries(2).failoverTo(CancelScheduleWorkflow::cancelScheduleStatus))
+                .build();
     }
 }
